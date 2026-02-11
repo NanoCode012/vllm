@@ -510,6 +510,32 @@ class Qwen3MoeModel(nn.Module):
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    def load_fused_expert_weights(
+        self,
+        name: str,
+        params_dict: dict,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        num_experts: int,
+    ) -> bool:
+        param = params_dict[name]
+        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+        loaded_local_expert = False
+        for expert_id in range(num_experts):
+            curr_expert_weight = loaded_weight[expert_id]
+            success = weight_loader(
+                param,
+                curr_expert_weight,
+                name,
+                shard_id,
+                expert_id,
+                return_success=True,
+            )
+            if success:
+                loaded_local_expert = True
+
+        return loaded_local_expert
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -549,6 +575,11 @@ class Qwen3MoeModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
+        is_fused_expert = False
+        fused_expert_params_mapping = [
+            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
+            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+        ]
         for name, loaded_weight in weights:
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
@@ -564,6 +595,10 @@ class Qwen3MoeModel(nn.Module):
                 loaded_params.add(scale_name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Detect fused expert format (transformers v5)
+                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
+                    is_fused_expert = True
+                    expert_params_mapping = fused_expert_params_mapping
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
@@ -624,24 +659,57 @@ class Qwen3MoeModel(nn.Module):
                     ):
                         continue
 
-                    param = params_dict[name_mapped]
-                    # We should ask the weight loader to return success or not
-                    # here since otherwise we may skip experts with other
-                    # available replicas.
-                    weight_loader = typing.cast(
-                        Callable[..., bool], param.weight_loader
-                    )
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        name = name_mapped
-                        break
+                    if is_fused_expert:
+                        # Handle fused expert format (transformers v5)
+                        num_experts = self.config.num_experts
+                        if "experts.gate_up_proj" in name:
+                            loaded_weight = loaded_weight.chunk(2, dim=-2)
+                            success_w1 = self.load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[0],
+                                "w1",
+                                num_experts,
+                            )
+                            success_w3 = self.load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[1],
+                                "w3",
+                                num_experts,
+                            )
+                            success = success_w1 and success_w3
+                        else:
+                            # down_proj
+                            success = self.load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                shard_id,
+                                num_experts,
+                            )
+                        if success:
+                            name = name_mapped
+                            break
+                    else:
+                        param = params_dict[name_mapped]
+                        # We should ask the weight loader to return success or not
+                        # here since otherwise we may skip experts with other
+                        # available replicas.
+                        weight_loader = typing.cast(
+                            Callable[..., bool], param.weight_loader
+                        )
+                        success = weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
+                        if success:
+                            name = name_mapped
+                            break
                 else:
                     if is_expert_weight:
                         # We've checked that this is an expert weight
